@@ -5,22 +5,23 @@ import pandas as pd
 import google.generativeai as genai
 
 # =================================================================
-# 1. CONFIGURACIÓN DE LA PÁGINA Y ESTILOS
+# 1. CONFIGURACIÓN DE LA PÁGINA
 # =================================================================
 st.set_page_config(page_title="BioSim Pro | Destilación Flash", layout="wide")
 
+# CSS para mejorar la estética
 st.markdown("""
     <style>
-    .main { background-color: #f5f7f9; }
-    .stMetric { background-color: #ffffff; padding: 15px; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+    .stDataFrame { border: 1px solid #e6e9ef; border-radius: 10px; }
+    .stGraphvizChart { display: flex; justify-content: center; }
     </style>
     """, unsafe_allow_html=True)
 
 # =================================================================
-# 2. LÓGICA DE SIMULACIÓN (ENCAPSULADA)
+# 2. LÓGICA DE SIMULACIÓN
 # =================================================================
 def run_simulation(f_water, f_eth, t_feed, p_flash):
-    # IMPORTANTE: Limpiar para evitar errores de IDs duplicados
+    # Limpiar el flowsheet para evitar errores de IDs duplicados en cada ejecución
     bst.main_flowsheet.clear()
     chemicals = tmo.Chemicals(["Water", "Ethanol"])
     bst.settings.set_thermo(chemicals)
@@ -31,13 +32,13 @@ def run_simulation(f_water, f_eth, t_feed, p_flash):
 
     # Equipos
     P100 = bst.Pump("P100", ins=mosto, P=4*101325)
-    W210 = bst.HXprocess("W210", ins=(P100-0, vinazas_retorno), outs=("Mosto_Pre", "Drenaje"), phase0="l", phase1="l")
+    W210 = bst.HXprocess("W210", ins=(P100-0, vinazas_retorno), outs=("Mosto_Pre", "Drenaje"), phase0='l', phase1='l')
     W210.outs[0].T = 85 + 273.15
     
     W220 = bst.HXutility("W220", ins=W210-0, outs="Mezcla", T=92+273.15)
     V100 = bst.IsenthalpicValve("V100", ins=W220-0, outs="Mezcla_Bifasica", P=p_flash)
     
-    # Manejo de error .duty: El Flash se define con Q=0 o V=fracción_vapor
+    # Flash configurado para evitar error de duty (Q=0 es adiabático)
     V1 = bst.Flash("V1", ins=V100-0, outs=("Vapor_caliente", "Vinazas"), P=p_flash, Q=0)
     
     W310 = bst.HXutility("W310", ins=V1-0, outs="Producto_Final", T=25+273.15)
@@ -48,83 +49,99 @@ def run_simulation(f_water, f_eth, t_feed, p_flash):
     return sys
 
 def generar_reportes(sistema):
-    # Tabla Materia
+    # Reporte de Materia
     m_data = []
     for s in sistema.streams:
-        if s.F_mass > 0.01:
+        if s.F_mass > 0:
             m_data.append({
-                "ID": s.ID, "Temp (°C)": s.T-273.15, "Flujo (kg/h)": s.F_mass, 
-                "Eth %": (s.imass['Ethanol']/s.F_mass)*100
+                "Corriente": s.ID,
+                "Temp (°C)": round(s.T - 273.15, 2),
+                "Flujo (kg/h)": round(s.F_mass, 2),
+                "Etanol %": round((s.imass['Ethanol']/s.F_mass)*100, 1) if s.F_mass > 0 else 0
             })
     
-    # Tabla Energía (Corrigiendo acceso a duty y power)
+    # Reporte de Energía
     e_data = []
     for u in sistema.units:
-        duty = getattr(u, 'duty', 0) / 3600 if hasattr(u, 'duty') else 0
-        power = u.power_utility.rate if u.power_utility else 0
-        if abs(duty) > 0.1 or power > 0.1:
-            e_data.append({"Equipo": u.ID, "Calor (kW)": duty, "Potencia (kW)": power})
+        # Verificación segura de atributos de energía
+        calor = 0.0
+        if hasattr(u, 'duty'):
+            calor = u.duty / 3600
+        elif isinstance(u, bst.HXprocess):
+            calor = (u.outs[0].H - u.ins[0].H) / 3600
+            
+        potencia = u.power_utility.rate if u.power_utility else 0
+        
+        if abs(calor) > 0.01 or potencia > 0.01:
+            e_data.append({
+                "Equipo": u.ID,
+                "Calor (kW)": round(calor, 2),
+                "Potencia Eléctrica (kW)": round(potencia, 2)
+            })
             
     return pd.DataFrame(m_data), pd.DataFrame(e_data)
 
 # =================================================================
-# 3. INTERFAZ DE USUARIO (LAYOUT)
+# 3. INTERFAZ DE USUARIO (LAYOUT COLUMNAS)
 # =================================================================
-st.title("🧪 BioSim: Simulador de Purificación de Etanol")
-st.subheader("Ingeniería de Procesos con IA")
+st.title("🧪 BioSim Pro: Purificación de Etanol")
+st.markdown("---")
 
-# Sidebar para parámetros
+# Sidebar
 with st.sidebar:
-    st.header("⚙️ Configuración")
-    f_w = st.slider("Flujo de Agua (kg/h)", 500, 2000, 900)
-    f_e = st.slider("Flujo de Etanol (kg/h)", 10, 500, 100)
+    st.header("📥 Parámetros de Entrada")
+    f_w = st.slider("Flujo Agua (kg/h)", 500, 2000, 900)
+    f_e = st.slider("Flujo Etanol (kg/h)", 10, 500, 100)
     p_f = st.number_input("Presión de Flash (Pa)", value=101325)
     
     st.divider()
-    api_key = st.text_input("Gemini API Key", type="password")
+    # Usar secrets de Streamlit o input manual
+    api_key = st.text_input("Gemini API Key", type="password", help="Pega tu clave de Google AI Studio")
 
-# Layout de dos columnas principales
-col_graf, col_res = st.columns([1, 1])
+# Botón de ejecución
+if st.button("🚀 Ejecutar Simulación", use_container_width=True):
+    try:
+        sys = run_simulation(f_w, f_e, 25, p_f)
+        df_m, df_e = generar_reportes(sys)
 
-if st.button("🚀 Ejecutar Simulación"):
-    with st.spinner("Simulando proceso..."):
-        try:
-            sys = run_simulation(f_w, f_e, 25, p_f)
-            df_m, df_e = generar_reportes(sys)
+        # Layout: Diagrama arriba, tablas abajo en columnas
+        st.subheader("📊 Diagrama de Flujo de Proceso (PFD)")
+        st.graphviz_chart(sys.diagram('dot'))
 
-            with col_graf:
-                st.subheader("📈 Diagrama de Proceso (PFD)")
-                # Renderizar diagrama usando Graphviz
-                st.graphviz_chart(sys.diagram('dot'))
-                
-            with col_res:
-                st.subheader("📋 Balances de Materia")
-                st.dataframe(df_m.style.format(precision=2), use_container_width=True)
-                
-                st.subheader("⚡ Consumo Energético")
-                st.dataframe(df_e.style.format(precision=2), use_container_width=True)
+        st.markdown("---")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("📋 Balance de Materia")
+            st.dataframe(df_m, use_container_width=True, hide_index=True)
+            
+        with col2:
+            st.subheader("⚡ Balance de Energía")
+            st.dataframe(df_e, use_container_width=True, hide_index=True)
 
-            # --- SECCIÓN IA ---
+        # --- SECCIÓN IA ---
+        if api_key:
             st.divider()
-            if api_key:
-                st.subheader("🤖 Análisis del Tutor IA")
-                genai.configure(api_key=api_key)
-                model = genai.GenerativeModel('gemini-2.5-pro')
-                
-                prompt = f"""
-                Analiza como tutor de Ingeniería Química:
-                Datos de corrientes: {df_m.to_string()}
-                Datos de equipos: {df_e.to_string()}
-                1. ¿Es buena la separación de etanol en el 'Producto_Final'?
-                2. Sugiere un cambio térmico para mejorar la eficiencia.
-                """
+            st.subheader("🤖 Consultoría Técnica (Gemini AI)")
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel('gemini-2.5-pro')
+            
+            prompt = f"""
+            Como experto en termodinámica, analiza estos resultados de BioSTEAM:
+            - Corrientes: {df_m.to_dict()}
+            - Energía: {df_e.to_dict()}
+            Explica brevemente si el tanque Flash está separando bien el etanol y qué pasaría si bajo la presión.
+            """
+            with st.spinner("IA analizando datos..."):
                 response = model.generate_content(prompt)
                 st.info(response.text)
-            else:
-                st.warning("Introduce tu API Key en el lateral para activar el Tutor IA.")
+        else:
+            st.warning("⚠️ Configura la API Key en el panel izquierdo para recibir consejos de la IA.")
 
-        except Exception as e:
-            st.error(f"Error en la simulación: {e}")
-
+    except Exception as e:
+        st.error(f"Se produjo un error: {e}")
+        st.info("Tip: Asegúrate de que los flujos no sean cero.")
 else:
-    st.info("Ajusta los parámetros en el panel lateral y pulsa 'Ejecutar Simulación'.")
+    st.light_circle = "Esperando parámetros..."
+    st.info("Configura los valores en la izquierda y presiona el botón para iniciar.")
